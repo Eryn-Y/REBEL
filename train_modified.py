@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 import wandb
+import json
 
 from accelerate import Accelerator
 from dataclasses import asdict, dataclass, field
@@ -26,6 +27,9 @@ from typing import Literal, Optional
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# python train_modified.py --task.input_repo processed_rlhf_dataset.jsonl --output-dir .
+
+
 @dataclass
 class REBELHParams:
     num_updates: tyro.conf.Suppress[int] = 1000
@@ -34,7 +38,7 @@ class REBELHParams:
 
 @dataclass
 class TaskHParams:
-    input_repo: str = None
+    input_repo: str = "data_aug"  # "processed_rlhf"
     """the output repo of filter_tokenize.py"""
     maxlen_prompt: int = 1024
     maxlen: int = 2048
@@ -54,7 +58,7 @@ class Args:
     """the wandb's project name"""
     run_name: Optional[str] = None
     """a unique name of this run"""
-    print_sample_output_freq: int = 200
+    print_sample_output_freq: int = 50
     """How often to print sample output"""
 
     # optimizer args
@@ -77,19 +81,23 @@ class Args:
     """per rank eval batch size"""
     total_episodes: int = 60000
     """The total number of episodes to train"""
+    num_epochs: Optional[int] = None
+    """The number of epochs to train. Overrides total_episodes if specified."""
 
     # optional args filled while running
-    world_size: Optional[int] = 4
+    world_size: Optional[int] = 3
     """The number of processes (GPUs) to use"""
     batch_size: Optional[int] = 128
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
     local_batch_size: Optional[int] = 128
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
+    to_train: bool = True
 
     # other args
-    base_model: str = "meta-llama/Meta-Llama-3-8B-Instruct"
+    base_model: str = "meta-llama/Llama-3.2-1B-Instruct"
+    load_state: str = None
     """the name of the pretrained model to use"""
-    output_dir: str = None
+    output_dir: str = "./"
     """Where to save the model"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rebel: REBELHParams = field(default_factory=REBELHParams)
@@ -103,7 +111,9 @@ def first_true_indices(bools, dtype=torch.long):
     Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
     """
     row_len = bools.size(-1)
-    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
+    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(
+        row_len, dtype=dtype, device=bools.device
+    )
     return torch.min(zero_or_index, dim=-1).values
 
 
@@ -114,16 +124,29 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
 
 
 def _get_cosine_schedule_with_warmup_lr_lambda(
-    current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: float
+    current_step: int,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float,
 ):
     if current_step < num_warmup_steps:
         return float(current_step) / float(max(1, num_warmup_steps))
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    progress = float(current_step - num_warmup_steps) / float(
+        max(1, num_training_steps - num_warmup_steps)
+    )
+    return max(
+        0.0,
+        0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
+    )
 
 
 def get_cosine_schedule_with_warmup(
-    optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5, last_epoch: int = -1
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1,
 ):
     lr_lambda = partial(
         _get_cosine_schedule_with_warmup_lr_lambda,
@@ -136,23 +159,35 @@ def get_cosine_schedule_with_warmup(
 
 def gather_logprob(args, model, tokenizer, query, response, device):
 
-    query_response = torch.cat((query, response), dim=-1).long().to(device).unsqueeze(0)
+    query_response = (
+        torch.cat((query, response), dim=-1).long().to(device).unsqueeze(0)
+    )
     response = response.long().to(device).unsqueeze(0)
     attention_mask = query_response != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(query_response, ~attention_mask, tokenizer.eos_token_id)
+    input_ids = torch.masked_fill(
+        query_response, ~attention_mask, tokenizer.eos_token_id
+    )
     with torch.no_grad():
         output = model(
-                    input_ids=input_ids, 
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                 )
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
         logits = output.logits[:, args.task.maxlen_prompt - 1 : -1]
         logits /= args.task.temperature + 1e-7
         all_logprob = F.log_softmax(logits, dim=-1)
-        logprob = torch.gather(all_logprob, 2, input_ids[:, args.task.maxlen_prompt:].unsqueeze(-1)).squeeze(-1)
-        sequence_length = first_true_indices(response == tokenizer.pad_token_id) - 1
-        seq_mask = torch.arange(args.task.maxlen, device=device).unsqueeze(0).expand_as(response) <= sequence_length.unsqueeze(1)
-        
+        logprob = torch.gather(
+            all_logprob,
+            2,
+            input_ids[:, args.task.maxlen_prompt :].unsqueeze(-1),
+        ).squeeze(-1)
+        sequence_length = (
+            first_true_indices(response == tokenizer.pad_token_id) - 1
+        )
+        seq_mask = torch.arange(args.task.maxlen, device=device).unsqueeze(
+            0
+        ).expand_as(response) <= sequence_length.unsqueeze(1)
+
         return (logprob * seq_mask).sum(-1)
 
 
@@ -162,7 +197,7 @@ def gather_all_logprob(args, process_idx, policy, tokenizer, dataset, device):
     start_idx = batch_size * process_idx
 
     # make batch size same for accelerator.gather
-    if start_idx + batch_size > len(dataset):
+    if (start_idx + batch_size) > len(dataset):
         start_idx = len(dataset) - batch_size
 
     chosen_logprob, reject_logprob, index = [], [], []
@@ -170,8 +205,26 @@ def gather_all_logprob(args, process_idx, policy, tokenizer, dataset, device):
     with torch.no_grad():
         for i in tqdm(range(start_idx, start_idx + batch_size)):
 
-            chosen_logprob.append(gather_logprob(args, policy, tokenizer, dataset[i]["llama_prompt_tokens"], dataset[i]["llama_chosen_tokens"], device))
-            reject_logprob.append(gather_logprob(args, policy, tokenizer, dataset[i]["llama_prompt_tokens"], dataset[i]["llama_reject_tokens"], device))
+            chosen_logprob.append(
+                gather_logprob(
+                    args,
+                    policy,
+                    tokenizer,
+                    dataset[i]["llama_prompt_tokens"],
+                    dataset[i]["llama_chosen_tokens"],
+                    device,
+                )
+            )
+            reject_logprob.append(
+                gather_logprob(
+                    args,
+                    policy,
+                    tokenizer,
+                    dataset[i]["llama_prompt_tokens"],
+                    dataset[i]["llama_reject_tokens"],
+                    device,
+                )
+            )
             index.append(i)
 
         chosen_logprob = torch.cat(chosen_logprob)
@@ -188,7 +241,7 @@ def gather_all_logprob(args, process_idx, policy, tokenizer, dataset, device):
     for i, data_i in enumerate(index):
         chosen_logprobs[data_i] = chosen_logprob[i]
         reject_logprobs[data_i] = reject_logprob[i]
-        
+
     return chosen_logprobs, reject_logprobs
 
 
@@ -196,20 +249,51 @@ def evaluate(args, policy, tokenizer, dataloader):
 
     device = policy.device
     loss, sign_align = [], []
+    # Social welfare
+    nash, utilitarian = [], []
     with torch.no_grad():
         for data in tqdm(dataloader):
-            
-            responses = torch.cat((data["llama_chosen_tokens"], data["llama_reject_tokens"]), dim=0)
-            logprobs = torch.cat((data["chosen_logprob"], data["reject_logprob"]), dim=0)
-            query_responses = torch.cat((torch.cat((data["llama_prompt_tokens"], data["llama_prompt_tokens"]), dim=0), responses), dim=1)
-            sequence_length = first_true_indices(responses == tokenizer.pad_token_id) - 1
-            seq_mask = torch.arange(args.task.maxlen, device=device).unsqueeze(0).expand_as(responses) <= sequence_length.unsqueeze(1)
+            # chosen and reject rewards/logprob are singular floats
+            # data example:
+            #         {'llama_prompt_tokens': tensor([[128256, 128256, 128256,  ...,  78191, 128007,    271]],
+            #       device='cuda:0'), 'chosen_reward': tensor([3.8393], device='cuda:0'), 'llama_chosen_tokens': tensor([[  1271,   1304,    502,  ..., 128256, 128256, 128256]],
+            #       device='cuda:0'), 'reject_reward': tensor([1.6071], device='cuda:0'), 'llama_reject_tokens': tensor([[ 40914,   3245,      0,  ..., 128256, 128256, 128256]],
+            #       device='cuda:0'), 'chosen_logprob': tensor([-112.4348], device='cuda:0'), 'reject_logprob': tensor([-137.9580], device='cuda:0')}
+
+            responses = torch.cat(
+                (data["llama_chosen_tokens"], data["llama_reject_tokens"]),
+                dim=0,
+            )
+            logprobs = torch.cat(
+                (data["chosen_logprob"], data["reject_logprob"]), dim=0
+            )
+            query_responses = torch.cat(
+                (
+                    torch.cat(
+                        (
+                            data["llama_prompt_tokens"],
+                            data["llama_prompt_tokens"],
+                        ),
+                        dim=0,
+                    ),
+                    responses,
+                ),
+                dim=1,
+            )
+            sequence_length = (
+                first_true_indices(responses == tokenizer.pad_token_id) - 1
+            )
+            seq_mask = torch.arange(args.task.maxlen, device=device).unsqueeze(
+                0
+            ).expand_as(responses) <= sequence_length.unsqueeze(1)
 
             attention_mask = query_responses != tokenizer.pad_token_id
-            input_ids = torch.masked_fill(query_responses, ~attention_mask, tokenizer.eos_token_id)
+            input_ids = torch.masked_fill(
+                query_responses, ~attention_mask, tokenizer.eos_token_id
+            )
 
             output = policy(
-                input_ids=input_ids, 
+                input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True,
                 output_hidden_states=True,
@@ -217,25 +301,106 @@ def evaluate(args, policy, tokenizer, dataloader):
             logits = output.logits[:, args.task.maxlen_prompt - 1 : -1]
             logits /= args.task.temperature + 1e-7
             new_all_logprobs = F.log_softmax(logits, dim=-1)
-            new_logprobs = torch.gather(new_all_logprobs, 2, input_ids[:, args.task.maxlen_prompt:].unsqueeze(-1)).squeeze(-1)
+            new_logprobs = torch.gather(
+                new_all_logprobs,
+                2,
+                input_ids[:, args.task.maxlen_prompt :].unsqueeze(-1),
+            ).squeeze(-1)
             new_logprobs = (new_logprobs * seq_mask).sum(-1)
-            ratio_logprob = new_logprobs - logprobs
-            ratio_logprob = ratio_logprob[:args.per_device_eval_batch_size] - ratio_logprob[args.per_device_eval_batch_size:]
+            ratio_logprob = (
+                new_logprobs - logprobs
+            )  # difference between the log-probabilities of the chosen and rejected responses (adjusted for the batch size)
+            ratio_logprob = (
+                ratio_logprob[: args.per_device_eval_batch_size]
+                - ratio_logprob[args.per_device_eval_batch_size :]
+            )
 
-            reg_diff = ratio_logprob - args.rebel.eta * (data["chosen_reward"] - data["reject_reward"])
-            loss.append((reg_diff ** 2).mean().reshape(1))
+            reg_diff = ratio_logprob - args.rebel.eta * (
+                data["chosen_reward"] - data["reject_reward"]
+            )
+            loss.append((reg_diff**2).mean().reshape(1))
 
-            sign_align.append((ratio_logprob > 0).float().mean().reshape(1))
+            sign_align.append(
+                (ratio_logprob > 0).float().mean().reshape(1)
+            )  # If the ratios are greater than 1 then (regardless of the different in log probability) the best answer was still selected.
+
+            # Social welfare
+            chosen_prob = torch.exp(data["chosen_logprob"])
+            reject_prob = torch.exp(data["reject_logprob"])
+            total_prob = chosen_prob + reject_prob
+
+            normalized_chosen_prob = torch.where(
+                total_prob != 0,
+                chosen_prob / total_prob,
+                torch.tensor(0.0, device=device),
+            )
+            normalized_reject_prob = torch.where(
+                total_prob != 0,
+                reject_prob / total_prob,
+                torch.tensor(0.0, device=device),
+            )
+
+            # If both are 0, just take the greater of the two (data["chosen_logprob"] vs. data["reject_logprob"]) and set to 1
+            normalized_chosen_prob = torch.where(
+                (normalized_chosen_prob == 0) & (normalized_reject_prob == 0),
+                torch.where(
+                    data["chosen_logprob"] >= data["reject_logprob"],
+                    torch.tensor(1.0, device=device),
+                    torch.tensor(0.0, device=device),
+                ),
+                normalized_chosen_prob,
+            )
+            normalized_reject_prob = torch.where(
+                (normalized_chosen_prob == 0) & (normalized_reject_prob == 0),
+                torch.where(
+                    data["reject_logprob"] > data["chosen_logprob"],
+                    torch.tensor(1.0, device=device),
+                    torch.tensor(0.0, device=device),
+                ),
+                normalized_reject_prob,
+            )
+
+            utilitarian.append(
+                (
+                    data["chosen_reward"] * normalized_chosen_prob
+                    + data["reject_reward"] * normalized_reject_prob
+                )
+            )
+
+            nash.append(
+                torch.exp(
+                    torch.log(data["chosen_reward"] * normalized_chosen_prob)
+                    + torch.log(data["reject_reward"] * normalized_reject_prob)
+                )
+            )
 
     loss = torch.cat(loss)
-    sign_align = torch.cat(sign_align)
-    return {"val_loss" : loss, "sign_align" : sign_align}
+    sign_align = torch.cat(
+        sign_align
+    )  # This indicates how often the model's predictions align with the rewards provided in the dataset.
+    nash = torch.cat(nash)
+    utilitarian = torch.cat(utilitarian)
+
+    metrics = {
+        "val_loss": loss,
+        "sign_align": sign_align,
+        "nash": nash,
+        "utilitarian": utilitarian,
+    }
+    # Write to file
+
+    print("Metrics: ", metrics)
+
+    return metrics
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
+
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
 
     random.seed(local_seed)
@@ -243,8 +408,14 @@ if __name__ == '__main__':
     torch.manual_seed(local_seed)
 
     args.world_size = accelerator.num_processes
-    args.batch_size = args.world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps
-    args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    args.batch_size = (
+        args.world_size
+        * args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+    )
+    args.local_batch_size = (
+        args.per_device_train_batch_size * args.gradient_accumulation_steps
+    )
     args.rebel.num_updates = args.total_episodes // args.batch_size
 
     # logging
@@ -265,11 +436,21 @@ if __name__ == '__main__':
                 save_code=True,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
-            wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
+            wandb.run.log_code(
+                ".",
+                include_fn=lambda path: any(
+                    [path.endswith(ext) for ext in file_extensions]
+                ),
+            )
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s"
+            % (
+                "\n".join(
+                    [f"|{key}|{value}|" for key, value in vars(args).items()]
+                )
+            ),
         )
         pprint(args)
     device = accelerator.device
@@ -277,45 +458,116 @@ if __name__ == '__main__':
 
     # policy
     tokenizer = AutoTokenizer.from_pretrained(
-                    args.base_model, 
-                    padding_side='right',
-                    trust_remote_code=True,                   
-                )
+        args.base_model,
+        padding_side="right",
+        trust_remote_code=True,
+    )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     policy = AutoModelForCausalLM.from_pretrained(
-                args.base_model,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                #attn_implementation="flash_attention_2",
-            )
+        args.base_model,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        # attn_implementation="flash_attention_2",
+    )
     disable_dropout_in_model(policy)
 
     # Prompt Collection Dataset
     compute_log = False
     try:
-        dataset = load_dataset(args.task.input_repo + '_logprob', split='train')
-        dataset = dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                        "llama_chosen_tokens", "chosen_reward", "chosen_logprob",
-                                                        "llama_reject_tokens", "reject_reward", "reject_logprob"])
-        temp_dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-        validation_dataset = load_dataset(args.task.input_repo + '_logprob', split='test')
-        validation_dataset = validation_dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                            "llama_chosen_tokens", "chosen_reward", "chosen_logprob",
-                                                            "llama_reject_tokens", "reject_reward", "reject_logprob"])
-    except:
-        #dataset = load_dataset(args.task.input_repo, split='train')
-        dataset = load_dataset("json", data_files={"train": args.task.input_repo}, split="train")
+        dataset = load_dataset(args.task.input_repo + "_logprob", split="train")
+        dataset = dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "chosen_logprob",
+                "llama_reject_tokens",
+                "reject_reward",
+                "reject_logprob",
+            ],
+        )
+        temp_dataloader = DataLoader(
+            dataset, batch_size=args.local_batch_size, shuffle=True
+        )
+        validation_dataset = load_dataset(
+            args.task.input_repo + "_logprob", split="test"
+        )
+        validation_dataset = validation_dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "chosen_logprob",
+                "llama_reject_tokens",
+                "reject_reward",
+                "reject_logprob",
+            ],
+        )
 
-        dataset = dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                        "llama_chosen_tokens", "chosen_reward",
-                                                        "llama_reject_tokens", "reject_reward"])
-        temp_dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-        #validation_dataset = load_dataset(args.task.input_repo, split='test')
-        validation_dataset = load_dataset("json", data_files={"test": args.task.input_repo}, split="test")
-        validation_dataset = validation_dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                            "llama_chosen_tokens", "chosen_reward",
-                                                            "llama_reject_tokens", "reject_reward"])
+        # Print the sizes of the train and validation datasets
+        accelerator.print(f"Train dataset size: {len(dataset)}")
+        accelerator.print(f"Validation dataset size: {len(validation_dataset)}")
+
+        # Calculate and print the percentage split
+        total_size = len(dataset) + len(validation_dataset)
+        train_percentage = (len(dataset) / total_size) * 100
+        validation_percentage = (len(validation_dataset) / total_size) * 100
+        accelerator.print(
+            f"Train: {train_percentage:.2f}%, Validation: {validation_percentage:.2f}%"
+        )
+
+    except:
+        # dataset = load_dataset(args.task.input_repo, split='train')
+        dataset = load_dataset(
+            "json",
+            data_files={"train": args.task.input_repo + "_train.jsonl"},
+            split="train",
+        )
+
+        dataset = dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "llama_reject_tokens",
+                "reject_reward",
+            ],
+        )
+        temp_dataloader = DataLoader(
+            dataset, batch_size=args.local_batch_size, shuffle=True
+        )
+        # validation_dataset = load_dataset(args.task.input_repo, split='test')
+        validation_dataset = load_dataset(
+            "json",
+            data_files={"test": args.task.input_repo + "_test.jsonl"},
+            split="test",
+        )
+        validation_dataset = validation_dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "llama_reject_tokens",
+                "reject_reward",
+            ],
+        )
         compute_log = True
+
+    # Print the sizes of the train and validation datasets
+    accelerator.print(f"Train dataset size: {len(dataset)}")
+    accelerator.print(f"Validation dataset size: {len(validation_dataset)}")
+
+    # Calculate and print the percentage split
+    total_size = len(dataset) + len(validation_dataset)
+    train_percentage = (len(dataset) / total_size) * 100
+    validation_percentage = (len(validation_dataset) / total_size) * 100
+    accelerator.print(
+        f"Train: {train_percentage:.2f}%, Validation: {validation_percentage:.2f}%"
+    )
 
     if accelerator.is_main_process:
         pprint(policy.config)
@@ -324,49 +576,110 @@ if __name__ == '__main__':
         optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(
-            policy.parameters(), 
+            policy.parameters(),
             lr=args.lr,
             betas=(0.9, 0.95),
             eps=args.eps,
-            weight_decay=args.weight_decay
+            weight_decay=args.weight_decay,
         )
-    scheduler = get_cosine_schedule_with_warmup(optimizer, int(args.rebel.num_updates * args.warmup_ratio * args.world_size), args.rebel.num_updates * args.world_size)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        int(args.rebel.num_updates * args.warmup_ratio * args.world_size),
+        args.rebel.num_updates * args.world_size,
+    )
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
-    policy, optimizer, _, scheduler = accelerator.prepare(policy, optimizer, temp_dataloader, scheduler)
+    policy, optimizer, _, scheduler = accelerator.prepare(
+        policy, optimizer, temp_dataloader, scheduler
+    )
+
+    dataset_size = len(dataset)
+    if args.num_epochs is not None:
+        args.total_episodes = (
+            dataset_size // args.batch_size
+        ) * args.num_epochs
+        print(
+            f"Total episodes calculated based on num_epochs: {args.total_episodes}"
+        )
 
     if compute_log:
-        accelerator.print('gathering validation logprob')
-        chosen_logprob, reject_logprob = gather_all_logprob(args, accelerator.process_index, accelerator.unwrap_model(policy), tokenizer, validation_dataset, device)
-        validation_dataset = validation_dataset.add_column("chosen_logprob", chosen_logprob)
-        validation_dataset = validation_dataset.add_column("reject_logprob", reject_logprob)
-        validation_dataset = validation_dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                                              "llama_chosen_tokens", "chosen_reward", "chosen_logprob",
-                                                                              "llama_reject_tokens", "reject_reward", "reject_logprob"])
+        accelerator.print("gathering validation logprob")
+        chosen_logprob, reject_logprob = gather_all_logprob(
+            args,
+            accelerator.process_index,
+            accelerator.unwrap_model(policy),
+            tokenizer,
+            validation_dataset,
+            device,
+        )
+        validation_dataset = validation_dataset.add_column(
+            "chosen_logprob", chosen_logprob
+        )
+        validation_dataset = validation_dataset.add_column(
+            "reject_logprob", reject_logprob
+        )
+        validation_dataset = validation_dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "chosen_logprob",
+                "llama_reject_tokens",
+                "reject_reward",
+                "reject_logprob",
+            ],
+        )
 
-        accelerator.print('gathering logprob')
-        chosen_logprob, reject_logprob = gather_all_logprob(args, accelerator.process_index, accelerator.unwrap_model(policy), tokenizer, dataset, device)
+        accelerator.print("gathering logprob")
+        chosen_logprob, reject_logprob = gather_all_logprob(
+            args,
+            accelerator.process_index,
+            accelerator.unwrap_model(policy),
+            tokenizer,
+            dataset,
+            device,
+        )
         dataset = dataset.add_column("chosen_logprob", chosen_logprob)
         dataset = dataset.add_column("reject_logprob", reject_logprob)
-        dataset = dataset.with_format("torch", columns=["llama_prompt_tokens", 
-                                                        "llama_chosen_tokens", "chosen_reward", "chosen_logprob",
-                                                        "llama_reject_tokens", "reject_reward", "reject_logprob"])
+        dataset = dataset.with_format(
+            "torch",
+            columns=[
+                "llama_prompt_tokens",
+                "llama_chosen_tokens",
+                "chosen_reward",
+                "chosen_logprob",
+                "llama_reject_tokens",
+                "reject_reward",
+                "reject_logprob",
+            ],
+        )
         if accelerator.is_main_process:
-            temp = DatasetDict({
-                "train" : dataset,
-                "test"  : validation_dataset,
-            })
-            temp.push_to_hub(args.task.input_repo + '_logprob')
+            temp = DatasetDict(
+                {
+                    "train": dataset,
+                    "test": validation_dataset,
+                }
+            )
+            # temp.push_to_hub(args.task.input_repo + "_logprob")
 
-    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size, shuffle=False)
+    dataloader = DataLoader(
+        dataset, batch_size=args.local_batch_size, shuffle=True
+    )
+    validation_dataloader = DataLoader(
+        validation_dataset,
+        batch_size=args.per_device_eval_batch_size,
+        shuffle=False,
+    )
     dataloader = accelerator.prepare(dataloader)
     validation_dataloader = accelerator.prepare(validation_dataloader)
+
     def repeat_generator():
         while True:
             yield from dataloader
+
     iter_dataloader = iter(repeat_generator())
 
     accelerator.print("===training policy===")
@@ -375,120 +688,256 @@ if __name__ == '__main__':
     start_time = time.time()
 
     kl_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
-    chosen_kl_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
-    reject_kl_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
+    chosen_kl_stats = torch.zeros(
+        args.gradient_accumulation_steps, device=device
+    )
+    reject_kl_stats = torch.zeros(
+        args.gradient_accumulation_steps, device=device
+    )
     loss_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
     ratio_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
 
-    policy.train()
-    for update in range(1, args.rebel.num_updates + 1):
+    if not args.to_train:
+        accelerator.load_state(args.load_state)
 
-        # update parameters
-        global_step += 1 * args.batch_size
-        lrnow = optimizer.param_groups[0]["lr"]
+    if args.to_train:
+        policy.train()
+        for update in range(1, args.rebel.num_updates + 1):
 
-        # save model
-        if (update - 1) % args.print_sample_output_freq == 0:
-            eval_dict = evaluate(args, accelerator.unwrap_model(policy), tokenizer, validation_dataloader)
-            writer.add_scalar("objective/validation_loss", accelerator.gather(eval_dict["val_loss"]).mean().item(), update)
-            writer.add_scalar("objective/sign_align", accelerator.gather(eval_dict["sign_align"]).mean().item(), update)
-            if args.output_dir:
-                accelerator.wait_for_everyone()
-                output_dir = os.path.join(args.output_dir, run_name)
-                os.makedirs(os.path.dirname(output_dir), exist_ok=True)
-                accelerator.save_state(output_dir=output_dir)
-                accelerator.wait_for_everyone()
-            torch.cuda.empty_cache()
+            # update parameters
+            global_step += 1 * args.batch_size
+            lrnow = optimizer.param_groups[0]["lr"]
 
-        # training
-        data = next(iter_dataloader)
-
-        gradient_accumulation_idx = 0
-        for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
-            mini_batch_end = mini_batch_start + args.per_device_train_batch_size
-            with accelerator.accumulate(policy):
-                mb_query = data["llama_prompt_tokens"][mini_batch_start : mini_batch_end]
-
-                mb_chosen_response = data["llama_chosen_tokens"][mini_batch_start : mini_batch_end]
-                mb_chosen_reward = data["chosen_reward"][mini_batch_start : mini_batch_end]
-                mb_chosen_logprob = data["chosen_logprob"][mini_batch_start : mini_batch_end]
-
-                mb_reject_response = data["llama_reject_tokens"][mini_batch_start : mini_batch_end]
-                mb_reject_reward = data["reject_reward"][mini_batch_start : mini_batch_end]
-                mb_reject_logprob = data["reject_logprob"][mini_batch_start : mini_batch_end]
-
-                mb_responses = torch.cat((mb_chosen_response, mb_reject_response), dim=0)
-                mb_logprobs = torch.cat((mb_chosen_logprob, mb_reject_logprob), dim=0)
-                mb_query_responses = torch.cat((torch.cat((mb_query, mb_query), dim=0), mb_responses), dim=1)
-                mb_sequence_length = first_true_indices(mb_responses == tokenizer.pad_token_id) - 1
-                mb_seq_mask = torch.arange(args.task.maxlen, device=device).unsqueeze(0).expand_as(mb_responses) <= mb_sequence_length.unsqueeze(1)
-
-                attention_mask = mb_query_responses != tokenizer.pad_token_id
-                input_ids = torch.masked_fill(mb_query_responses, ~attention_mask, tokenizer.eos_token_id)
-
-                output = policy(
-                    input_ids=input_ids, 
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    output_hidden_states=True,
+            # save model
+            if (update - 1) % args.print_sample_output_freq == 0:
+                eval_dict = evaluate(
+                    args,
+                    accelerator.unwrap_model(policy),
+                    tokenizer,
+                    validation_dataloader,
                 )
-                logits = output.logits[:, args.task.maxlen_prompt - 1 : -1]
-                logits /= args.task.temperature + 1e-7
-                new_all_logprobs = F.log_softmax(logits, dim=-1)
-                new_logprobs = torch.gather(new_all_logprobs, 2, input_ids[:, args.task.maxlen_prompt:].unsqueeze(-1)).squeeze(-1)
-                new_logprobs = (new_logprobs * mb_seq_mask).sum(-1)
+                writer.add_scalar(
+                    "objective/validation_loss",
+                    accelerator.gather(eval_dict["val_loss"]).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "objective/sign_align",
+                    accelerator.gather(eval_dict["sign_align"]).mean().item(),
+                    update,
+                )
+                if args.output_dir:
+                    accelerator.wait_for_everyone()
+                    output_dir = os.path.join(args.output_dir, run_name)
+                    os.makedirs(os.path.dirname(output_dir), exist_ok=True)
+                    accelerator.save_state(output_dir=output_dir)
+                    accelerator.wait_for_everyone()
+                torch.cuda.empty_cache()
 
-                if update == 1:
-                    print(('logprobs:', new_logprobs, mb_logprobs))
+            # training
+            data = next(iter_dataloader)
 
-                ratio_logprob = new_logprobs - mb_logprobs
-                ratio_logprob = ratio_logprob[:args.per_device_train_batch_size] - ratio_logprob[args.per_device_train_batch_size:]
-                reg_diff = ratio_logprob - args.rebel.eta * (mb_chosen_reward - mb_reject_reward)
-                loss = (reg_diff ** 2).mean()
+            gradient_accumulation_idx = 0
+            for mini_batch_start in range(
+                0, args.local_batch_size, args.per_device_train_batch_size
+            ):
+                mini_batch_end = (
+                    mini_batch_start + args.per_device_train_batch_size
+                )
+                with accelerator.accumulate(policy):
+                    mb_query = data["llama_prompt_tokens"][
+                        mini_batch_start:mini_batch_end
+                    ]
 
-                accelerator.backward(loss)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                with torch.no_grad():
-                    logprobs_diff = new_logprobs - mb_logprobs
-                    ratio = torch.exp(logprobs_diff)
-                    kl_stats[gradient_accumulation_idx] = logprobs_diff.mean()
-                    chosen_kl_stats[gradient_accumulation_idx] = logprobs_diff[:args.per_device_train_batch_size].mean()
-                    reject_kl_stats[gradient_accumulation_idx] = logprobs_diff[args.per_device_train_batch_size:].mean()
-                    loss_stats[gradient_accumulation_idx] = loss
-                    ratio_stats[gradient_accumulation_idx] = ratio.mean()
-            gradient_accumulation_idx += 1
-        if accelerator.is_main_process:
-            console.print(
-                f"update",
-                update,
-                "kl_stats",
-                kl_stats.mean().item(),
-                "loss",
-                loss_stats.mean().item(),
-            )
+                    mb_chosen_response = data["llama_chosen_tokens"][
+                        mini_batch_start:mini_batch_end
+                    ]
+                    mb_chosen_reward = data["chosen_reward"][
+                        mini_batch_start:mini_batch_end
+                    ]
+                    mb_chosen_logprob = data["chosen_logprob"][
+                        mini_batch_start:mini_batch_end
+                    ]
 
-        with torch.no_grad():
-            writer.add_scalar("objective/kl", accelerator.gather(kl_stats).mean().item(), update)
-            writer.add_scalar("objective/chosen_kl", accelerator.gather(chosen_kl_stats).mean().item(), update)
-            writer.add_scalar("objective/reject_kl", accelerator.gather(reject_kl_stats).mean().item(), update)
-            writer.add_scalar("rebel/loss/policy", accelerator.gather(loss).mean().item(), update)
-            writer.add_scalar("rebel/loss/policy_avg", accelerator.gather(loss_stats).mean().item(), update)
-            
-            writer.add_scalar("rebel/val/ratio", accelerator.gather(ratio_stats).mean().item(), update)
-            writer.add_scalar("rebel/val/ratio_var", accelerator.gather(ratio_stats).var().item(), update)
-            writer.add_scalar("rebel/lr", lrnow, update)
-            writer.add_scalar("rebel/episode", global_step, update)
-            eps = int(global_step / (time.time() - start_time))
-            writer.add_scalar("rebel/eps", eps, update)
-            accelerator.print("rebel/eps", eps, update)
-            torch.cuda.empty_cache()
+                    mb_reject_response = data["llama_reject_tokens"][
+                        mini_batch_start:mini_batch_end
+                    ]
+                    mb_reject_reward = data["reject_reward"][
+                        mini_batch_start:mini_batch_end
+                    ]
+                    mb_reject_logprob = data["reject_logprob"][
+                        mini_batch_start:mini_batch_end
+                    ]
+
+                    mb_responses = torch.cat(
+                        (mb_chosen_response, mb_reject_response), dim=0
+                    )
+                    mb_logprobs = torch.cat(
+                        (mb_chosen_logprob, mb_reject_logprob), dim=0
+                    )
+                    mb_query_responses = torch.cat(
+                        (torch.cat((mb_query, mb_query), dim=0), mb_responses),
+                        dim=1,
+                    )
+                    mb_sequence_length = (
+                        first_true_indices(
+                            mb_responses == tokenizer.pad_token_id
+                        )
+                        - 1
+                    )
+                    mb_seq_mask = torch.arange(
+                        args.task.maxlen, device=device
+                    ).unsqueeze(0).expand_as(
+                        mb_responses
+                    ) <= mb_sequence_length.unsqueeze(
+                        1
+                    )
+
+                    attention_mask = (
+                        mb_query_responses != tokenizer.pad_token_id
+                    )
+                    input_ids = torch.masked_fill(
+                        mb_query_responses,
+                        ~attention_mask,
+                        tokenizer.eos_token_id,
+                    )
+
+                    output = policy(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                        output_hidden_states=True,
+                    )
+                    logits = output.logits[:, args.task.maxlen_prompt - 1 : -1]
+                    logits /= args.task.temperature + 1e-7
+                    new_all_logprobs = F.log_softmax(logits, dim=-1)
+                    new_logprobs = torch.gather(
+                        new_all_logprobs,
+                        2,
+                        input_ids[:, args.task.maxlen_prompt :].unsqueeze(-1),
+                    ).squeeze(-1)
+                    new_logprobs = (new_logprobs * mb_seq_mask).sum(-1)
+
+                    if update == 1:
+                        print(("logprobs:", new_logprobs, mb_logprobs))
+
+                    ratio_logprob = new_logprobs - mb_logprobs
+                    ratio_logprob = (
+                        ratio_logprob[: args.per_device_train_batch_size]
+                        - ratio_logprob[args.per_device_train_batch_size :]
+                    )
+                    reg_diff = ratio_logprob - args.rebel.eta * (
+                        mb_chosen_reward - mb_reject_reward
+                    )
+                    loss = (reg_diff**2).mean()
+
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    with torch.no_grad():
+                        logprobs_diff = new_logprobs - mb_logprobs
+                        ratio = torch.exp(logprobs_diff)
+                        kl_stats[gradient_accumulation_idx] = (
+                            logprobs_diff.mean()
+                        )
+                        chosen_kl_stats[gradient_accumulation_idx] = (
+                            logprobs_diff[
+                                : args.per_device_train_batch_size
+                            ].mean()
+                        )
+                        reject_kl_stats[gradient_accumulation_idx] = (
+                            logprobs_diff[
+                                args.per_device_train_batch_size :
+                            ].mean()
+                        )
+                        loss_stats[gradient_accumulation_idx] = loss
+                        ratio_stats[gradient_accumulation_idx] = ratio.mean()
+                gradient_accumulation_idx += 1
+            if accelerator.is_main_process:
+                console.print(
+                    f"update",
+                    update,
+                    "kl_stats",
+                    kl_stats.mean().item(),
+                    "loss",
+                    loss_stats.mean().item(),
+                )
+
+            with torch.no_grad():
+                writer.add_scalar(
+                    "objective/kl",
+                    accelerator.gather(kl_stats).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "objective/chosen_kl",
+                    accelerator.gather(chosen_kl_stats).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "objective/reject_kl",
+                    accelerator.gather(reject_kl_stats).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "rebel/loss/policy",
+                    accelerator.gather(loss).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "rebel/loss/policy_avg",
+                    accelerator.gather(loss_stats).mean().item(),
+                    update,
+                )
+
+                writer.add_scalar(
+                    "rebel/val/ratio",
+                    accelerator.gather(ratio_stats).mean().item(),
+                    update,
+                )
+                writer.add_scalar(
+                    "rebel/val/ratio_var",
+                    accelerator.gather(ratio_stats).var().item(),
+                    update,
+                )
+                writer.add_scalar("rebel/lr", lrnow, update)
+                writer.add_scalar("rebel/episode", global_step, update)
+                eps = int(global_step / (time.time() - start_time))
+                writer.add_scalar("rebel/eps", eps, update)
+                accelerator.print("rebel/eps", eps, update)
+                torch.cuda.empty_cache()
 
     # save model
-    eval_dict = evaluate(args, accelerator.unwrap_model(policy), tokenizer, validation_dataloader)
-    writer.add_scalar("objective/validation_loss", accelerator.gather(eval_dict["val_loss"]).mean().item(), update)
-    writer.add_scalar("objective/sign_align", accelerator.gather(eval_dict["sign_align"]).mean().item(), update)
+    eval_dict = evaluate(
+        args, accelerator.unwrap_model(policy), tokenizer, validation_dataloader
+    )
+    # Save eval_dict to json file
+    if accelerator.is_main_process:
+        eval_dict_path = os.path.join(
+            args.output_dir, f"{run_name}_eval_metrics.json"
+        )
+        with open(eval_dict_path, "w") as f:
+            json.dump(
+                {
+                    key: accelerator.gather(value).tolist()
+                    for key, value in eval_dict.items()
+                },
+                f,
+                indent=4,
+            )
+        accelerator.print(f"Evaluation metrics saved to {eval_dict_path}")
+
+    writer.add_scalar(
+        "objective/validation_loss",
+        accelerator.gather(eval_dict["val_loss"]).mean().item(),
+        update,
+    )
+    writer.add_scalar(
+        "objective/sign_align",
+        accelerator.gather(eval_dict["sign_align"]).mean().item(),
+        update,
+    )
     if args.output_dir:
         accelerator.wait_for_everyone()
         output_dir = os.path.join(args.output_dir, run_name)
